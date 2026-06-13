@@ -1,5 +1,5 @@
 <#
-PSSCP v6.2.0 - PowerShell Script Checker Plus
+PSSCP v6.3.0 - PowerShell Script Checker Plus
 
 Purpose
 -------
@@ -18,6 +18,7 @@ Optional controls
 -----------------
     $env:PSSCP_PATH='C:\Scripts'          # Scan a specific folder instead of current directory
     $env:PSSCP_NO_INSTALL='1'             # Do not auto-install PSScriptAnalyzer
+    $env:PSSCP_NO_POLICY_BYPASS='1'       # Do not temporarily set process-scope ExecutionPolicy Bypass for PSScriptAnalyzer import
     $env:PSSCP_WRITE_REPORTS='1'          # Write JSON, MD, SARIF, CSV and AI prompt files
     $env:PSSCP_INCLUDE_INFO='0'           # Hide Info findings in the full console detail
     $env:PSSCP_NO_CROSS_PARSE='1'         # Skip parser probe under powershell.exe/pwsh.exe
@@ -57,9 +58,10 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     # Configuration
     # -----------------------------
     $ToolName = 'PSSCP'
-    $ToolVersion = '6.2.0'
+    $ToolVersion = '6.3.0'
     $Profile = if($env:PSSCP_PROFILE){ $env:PSSCP_PROFILE } else { 'General' }
     $AutoInstallDeps = ($env:PSSCP_NO_INSTALL -ne '1')
+    $AllowProcessPolicyBypass = ($env:PSSCP_NO_POLICY_BYPASS -ne '1')
     $WriteReports = ($env:PSSCP_WRITE_REPORTS -eq '1')
     $CrossParse = ($env:PSSCP_NO_CROSS_PARSE -ne '1')
     $IncludeInfo = ($env:PSSCP_INCLUDE_INFO -ne '0')
@@ -366,6 +368,9 @@ try { Get-Process | Out-Null } catch {}
     # -----------------------------
     try { if($PSVersionTable.PSVersion.Major -le 5){ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } } catch {}
     $SA = Get-Module -ListAvailable PSScriptAnalyzer -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    $SAImported = $false
+    $SAPolicyBypassUsed = $false
+    $SAImportError = $null
     if(-not $SA -and $AutoInstallDeps){
         _Add '<PSSCP>' 'PSSCP000' Info Dependency Dependency 0 High 'PSScriptAnalyzer not found; attempting CurrentUser install' 'Allow install, or set PSSCP_NO_INSTALL=1 to skip automatic dependency installation'
         try {
@@ -385,8 +390,27 @@ try { Get-Process | Out-Null } catch {}
         $SA = Get-Module -ListAvailable PSScriptAnalyzer -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
     }
     if($SA){
-        try { Import-Module PSScriptAnalyzer -ErrorAction Stop; _Add '<PSSCP>' 'PSSCP000' Info Dependency Dependency 0 High "PSScriptAnalyzer loaded: $($SA.Version)" 'No action required' }
-        catch { _Add '<PSSCP>' 'PSSCP000' Warning Dependency Dependency 0 Medium 'PSScriptAnalyzer import failed' 'Repair/reinstall PSScriptAnalyzer' $_.Exception.Message }
+        try {
+            Import-Module PSScriptAnalyzer -ErrorAction Stop
+            $SAImported = $true
+            _Add '<PSSCP>' 'PSSCP000' Info Dependency Dependency 0 High "PSScriptAnalyzer loaded: $($SA.Version)" 'No action required'
+        } catch {
+            $SAImportError = $_.Exception.Message
+            if($AllowProcessPolicyBypass -and $SAImportError -match 'running scripts is disabled|Execution_Policies|cannot be loaded because running scripts'){
+                try {
+                    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
+                    $SAPolicyBypassUsed = $true
+                    Import-Module PSScriptAnalyzer -ErrorAction Stop
+                    $SAImported = $true
+                    _Add '<PSSCP>' 'PSSCP000' Info Dependency Dependency 0 High "PSScriptAnalyzer loaded after process-scope ExecutionPolicy Bypass: $($SA.Version)" 'No action required; this affects only the current PowerShell process and does not execute target scripts'
+                } catch {
+                    $SAImportError = $_.Exception.Message
+                    _Add '<PSSCP>' 'PSSCP000' Warning Dependency Dependency 0 Medium 'PSScriptAnalyzer import failed even after process-scope policy bypass' 'Repair/reinstall PSScriptAnalyzer or run with a policy that permits module imports' $SAImportError
+                }
+            } else {
+                _Add '<PSSCP>' 'PSSCP000' Warning Dependency Dependency 0 Medium 'PSScriptAnalyzer import failed' 'Repair/reinstall PSScriptAnalyzer or run with a policy that permits module imports' $SAImportError
+            }
+        }
     } else {
         _Add '<PSSCP>' 'PSSCP000' Warning Dependency Dependency 0 High 'PSScriptAnalyzer unavailable' 'Install-Module PSScriptAnalyzer -Scope CurrentUser -Force for fuller analysis'
     }
@@ -739,8 +763,8 @@ try { Get-Process | Out-Null } catch {}
             } catch { _Add $rel 'PSSCP080' Info Maintainability Manifest 0 Low 'Test-ModuleManifest failed or file is not a module manifest' 'Ignore for non-module data files; fix if intended as a module manifest' $_.Exception.Message }
         }
 
-        # PSScriptAnalyzer.
-        if($SA){
+        # PSScriptAnalyzer. Only run it after a successful module import, and skip parser-broken files.
+        if($SAImported -and -not @($parseErrors).Count){
             try {
                 foreach($a in @(Invoke-ScriptAnalyzer -Path $f.FullName -Severity Error,Warning,Information -ErrorAction Stop)){
                     $sev = if($a.Severity -eq 'Error'){'Error'}elseif($a.Severity -eq 'Warning'){'Warning'}else{'Info'}
@@ -748,7 +772,9 @@ try { Get-Process | Out-Null } catch {}
                     _Add $rel 'PSSCP070' $sev Maintainability PSScriptAnalyzer $a.Line High "$($a.RuleName): $($a.Message)" 'Fix the rule finding or document why it is acceptable' $ev
                 }
             } catch { _Add $rel 'PSSCP070' Warning Maintainability PSScriptAnalyzer 0 Medium 'PSScriptAnalyzer failed on this file' 'Check parser state and rerun analysis' $_.Exception.Message }
-        } else { _Add $rel 'PSSCP070' Warning Maintainability PSScriptAnalyzer 0 High 'PSScriptAnalyzer is not installed' 'Install-Module PSScriptAnalyzer -Scope CurrentUser -Force, then rerun for best-practice analysis' }
+        } elseif($SAImported -and @($parseErrors).Count) {
+            _Add $rel 'PSSCP070' Info Maintainability PSScriptAnalyzer 0 High 'PSScriptAnalyzer skipped because parser errors already make this file invalid' 'Fix parser errors first, then rerun for ScriptAnalyzer findings'
+        }
 
         # Per-file summary.
         _Add $rel 'PSSCP000' Info Maintainability Inventory 0 Low "Inventory: commands=$(@($commands.Name | Sort-Object -Unique).Count), functions=$($functionNames.Count), params=$($paramAsts.Count), variables=$($variableNames.Count), types=$($typeAsts.Count)" 'Use this inventory to verify the script shape matches expectations'
@@ -778,10 +804,10 @@ try { Get-Process | Out-Null } catch {}
     # -----------------------------
     # Context, grouped findings, reports, gate and output
     # -----------------------------
-    $saStatus = if($SA){ "Enabled: $($SA.Version)" } else { 'Unavailable' }
+    $saStatus = if($SAImported){ if($SAPolicyBypassUsed){ "Imported with process policy bypass: $($SA.Version)" } else { "Imported: $($SA.Version)" } } elseif($SA){ "Installed but not imported: $($SA.Version)" } else { 'Unavailable' }
     $Context = [pscustomobject]@{
         Tool=$ToolName;ToolVersion=$ToolVersion;Profile=$Profile;RunTime=(Get-Date).ToString('s');Root=$Root;FilesScanned=$Files.Count;ChangedOnly=$ChangedOnly;SelfTest=$SelfTest;ExecutedTargetScripts=$false;
-        PowerShell="$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)";PSScriptAnalyzer=$saStatus;AutoInstallDependencies=$AutoInstallDeps;CrossParse=$CrossParse;WriteReports=$WriteReports;FailOn=$FailOn;MinScore=$MinScore;MaxFileMB=$MaxFileMB;KeepSelfTest=$KeepSelfTest
+        PowerShell="$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)";PSScriptAnalyzer=$saStatus;AutoInstallDependencies=$AutoInstallDeps;ProcessPolicyBypassAllowed=$AllowProcessPolicyBypass;CrossParse=$CrossParse;WriteReports=$WriteReports;FailOn=$FailOn;MinScore=$MinScore;MaxFileMB=$MaxFileMB;KeepSelfTest=$KeepSelfTest
     }
 
     $GateFail = $false; $GateReasons = [Collections.Generic.List[string]]::new()
