@@ -1,5 +1,5 @@
 <#
-PSSCP v6.0.1 - PowerShell Script Checker Plus
+PSSCP v6.2.0 - PowerShell Script Checker Plus
 
 Purpose
 -------
@@ -25,8 +25,9 @@ Optional controls
     $env:PSSCP_MIN_SCORE='75'             # Gate fail if any file score is below this
     $env:PSSCP_CI='1'                     # Exit 1 on gate failure
     $env:PSSCP_SELFTEST='1'               # Run built-in static self-test snippets instead of current folder
+    $env:PSSCP_KEEP_SELFTEST='1'           # Keep temporary self-test files for troubleshooting
     $env:PSSCP_PROFILE='General'          # General, Strict, Report, Cloud, Destructive
-    $env:PSSCP_CHANGED_ONLY='1'           # In a Git repo, scan changed PowerShell files only where possible
+    $env:PSSCP_CHANGED_ONLY='1'           # In a Git repo, scan changed PowerShell files only; does not fall back to full scan
     $env:PSSCP_EXCLUDE='regex'            # Additional path exclusion regex
     $env:PSSCP_MAX_FILE_MB='5'            # Skip huge files
     $env:PSSCP_MAX_EVIDENCE='1200'        # Evidence length per finding
@@ -56,7 +57,7 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     # Configuration
     # -----------------------------
     $ToolName = 'PSSCP'
-    $ToolVersion = '6.0.1'
+    $ToolVersion = '6.2.0'
     $Profile = if($env:PSSCP_PROFILE){ $env:PSSCP_PROFILE } else { 'General' }
     $AutoInstallDeps = ($env:PSSCP_NO_INSTALL -ne '1')
     $WriteReports = ($env:PSSCP_WRITE_REPORTS -eq '1')
@@ -64,6 +65,7 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     $IncludeInfo = ($env:PSSCP_INCLUDE_INFO -ne '0')
     $ChangedOnly = ($env:PSSCP_CHANGED_ONLY -eq '1')
     $SelfTest = ($env:PSSCP_SELFTEST -eq '1')
+    $KeepSelfTest = ($env:PSSCP_KEEP_SELFTEST -eq '1')
     $FailOn = if($env:PSSCP_FAIL_ON){ $env:PSSCP_FAIL_ON } else { 'Never' }
     $MinScore = 0
     if(-not [int]::TryParse([string]$env:PSSCP_MIN_SCORE,[ref]$MinScore)){ $MinScore = 0 }
@@ -77,7 +79,7 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
 
     $Root = $BaseRoot
     $Extensions = @('.ps1','.psm1','.psd1')
-    $DefaultExclude = '\\(\.git|\.hg|\.svn|bin|obj|node_modules|packages|\.terraform|\.venv|venv|dist|build|out|__pycache__)\\'
+    $DefaultExclude = '[\\/](\.git|\.hg|\.svn|bin|obj|node_modules|packages|\.terraform|\.venv|venv|dist|build|out|__pycache__)[\\/]'
     $AdditionalExclude = [string]$env:PSSCP_EXCLUDE
 
     $Findings = [Collections.Generic.List[object]]::new()
@@ -89,6 +91,7 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     $Suppressions = @{}
     $FileByLowerPath = @{}
     $KnownChangedFiles = @{}
+    $SuppressionKnownAreas = @('Parser','Requires','Read','Encoding','Formatting','Signature','CrossParse','Command','DynamicCommand','Alias','Parameter','DotSource','LocalFunction','ModuleFamily','Context','Risk','DestructiveScope','PipelineScope','ShouldProcess','ErrorHandling','PrivilegedChange','Elevation','Pipeline','Security','Secret','RemoteExecution','Encoded','Interop','SupplyChain','Unicode','Errors','Retry','Pagination','ReportQuality','Context','OutputLoss','Csv','Console','Path','PS7Syntax','WindowsSpecific','Placeholder','CommentMismatch','Marker','DeadCode','Manifest','PSScriptAnalyzer','Suppression','SelfTest','Dependency','Inventory')
 
     # -----------------------------
     # Rule metadata / helper functions
@@ -248,17 +251,18 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     }
     function _IsSuppressed([string]$File,[string]$Id,[string]$Category,[string]$Area,[int]$Line){
         if(-not $Suppressions.ContainsKey($File)){ return $false }
+        $idL = ([string]$Id).ToLowerInvariant(); $catL = ([string]$Category).ToLowerInvariant(); $areaL = ([string]$Area).ToLowerInvariant()
         foreach($s in @($Suppressions[$File])){
             if($s.Line -ne 0 -and $s.Line -ne $Line){ continue }
             foreach($k in @($s.Keys)){
-                $key = $k.Trim()
-                if($key -eq '*' -or $key -eq $Id -or $key -eq $Category -or $key -eq $Area){ return $true }
+                $key = ([string]$k).Trim().ToLowerInvariant()
+                if($key -eq '*' -or $key -eq $idL -or $key -eq $catL -or $key -eq $areaL){ return $true }
             }
         }
         return $false
     }
     function _Add([string]$File,[string]$Id,[string]$Severity,[string]$Category,[string]$Area,[int]$Line,[string]$Confidence,[string]$Issue,[string]$Recommendation,[object]$Evidence=''){
-        if($File -and $File -ne '<PSSCP>' -and (_IsSuppressed $File $Id $Category $Area $Line)){ return }
+        if($Id -ne 'PSSCP090' -and $File -and $File -ne '<PSSCP>' -and (_IsSuppressed $File $Id $Category $Area $Line)){ return }
         $impact = _BaseImpact $Severity $Confidence $Category
         $title = if($RuleMeta.ContainsKey($Id)){ $RuleMeta[$Id].Title } else { $Area }
         $Findings.Add([pscustomobject]@{
@@ -280,6 +284,10 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
         if($Command -match '^(Invoke)-' -or $Command -in @('Start-Process','cmd','cmd.exe','powershell','powershell.exe','pwsh','pwsh.exe')){ return 'ExternalOrInvoke' }
         return 'Review'
     }
+    function _MdCell([object]$Value){
+        if($null -eq $Value){ return '' }
+        return (([string]$Value) -replace '\|','\|' -replace "`r?`n",' ')
+    }
     function _WriteMarkdown([string]$Path,$Context,$Summary,$Findings){
         $b = [Text.StringBuilder]::new()
         [void]$b.AppendLine('# PSSCP Static Analysis Report')
@@ -291,17 +299,17 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
         [void]$b.AppendLine('| File | Score | Rating | Critical | Errors | Warnings | Info | Syntax | Security | Safety | Reliability | Output | Dependency | Maintainability | Compatibility |')
         [void]$b.AppendLine('|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
         foreach($s in @($Summary | Sort-Object Score,File)){
-            [void]$b.AppendLine("| $($s.File) | $($s.Score) | $($s.Rating) | $($s.Critical) | $($s.Errors) | $($s.Warnings) | $($s.Info) | $($s.SyntaxScore) | $($s.SecurityScore) | $($s.SafetyScore) | $($s.ReliabilityScore) | $($s.OutputScore) | $($s.DependencyScore) | $($s.MaintainabilityScore) | $($s.CompatibilityScore) |")
+            [void]$b.AppendLine("| $(_MdCell $s.File) | $($s.Score) | $(_MdCell $s.Rating) | $($s.Critical) | $($s.Errors) | $($s.Warnings) | $($s.Info) | $($s.SyntaxScore) | $($s.SecurityScore) | $($s.SafetyScore) | $($s.ReliabilityScore) | $($s.OutputScore) | $($s.DependencyScore) | $($s.MaintainabilityScore) | $($s.CompatibilityScore) |")
         }
         [void]$b.AppendLine('')
         [void]$b.AppendLine('## Findings')
         foreach($f in @($Findings | Sort-Object File,@{Expression={_Rank $_.Severity}},Line,Id)){
-            [void]$b.AppendLine("### [$($f.Severity)] $($f.Id) $($f.File):$($f.Line) - $($f.Title)")
-            [void]$b.AppendLine("- **Category:** $($f.Category)")
-            [void]$b.AppendLine("- **Area:** $($f.Area)")
-            [void]$b.AppendLine("- **Confidence:** $($f.Confidence)")
-            [void]$b.AppendLine("- **Issue:** $($f.Issue)")
-            [void]$b.AppendLine("- **Recommendation:** $($f.Recommendation)")
+            [void]$b.AppendLine("### [$(_MdCell $f.Severity)] $(_MdCell $f.Id) $(_MdCell $f.File):$($f.Line) - $(_MdCell $f.Title)")
+            [void]$b.AppendLine("- **Category:** $(_MdCell $f.Category)")
+            [void]$b.AppendLine("- **Area:** $(_MdCell $f.Area)")
+            [void]$b.AppendLine("- **Confidence:** $(_MdCell $f.Confidence)")
+            [void]$b.AppendLine("- **Issue:** $(_MdCell $f.Issue)")
+            [void]$b.AppendLine("- **Recommendation:** $(_MdCell $f.Recommendation)")
             if($f.Evidence){ [void]$b.AppendLine('- **Evidence:** `' + (($f.Evidence -replace '`','``')) + '`') }
             [void]$b.AppendLine('')
         }
@@ -389,15 +397,25 @@ try { Get-Process | Out-Null } catch {}
     $Files = @()
     if($ChangedOnly -and (Get-Command git -ErrorAction SilentlyContinue)){
         try {
-            $changed = @(git -C $Root status --porcelain 2>$null | ForEach-Object { $_.Substring(3).Trim('"') } | Where-Object { $_ })
+            $changed = @(git -C $Root status --porcelain 2>$null | ForEach-Object {
+                $x = $_
+                if($x.Length -ge 4){
+                    $p = $x.Substring(3).Trim()
+                    if($p -match ' -> '){ $p = ($p -split ' -> ')[-1] }
+                    $p.Trim('"')
+                }
+            } | Where-Object { $_ })
             foreach($c in $changed){
                 $p = Join-Path $Root $c
-                if(Test-Path -LiteralPath $p -PathType Leaf){ $KnownChangedFiles[$p.ToLowerInvariant()] = $true }
+                if(Test-Path -LiteralPath $p -PathType Leaf){ $KnownChangedFiles[$p.ToLowerInvariant()] = $p }
             }
         } catch {}
     }
     if($KnownChangedFiles.Count -gt 0){
-        $Files = @(Get-Item -LiteralPath @($KnownChangedFiles.Keys) -ErrorAction SilentlyContinue | Where-Object { $Extensions -contains $_.Extension -and ($_.Length/1MB) -le $MaxFileMB })
+        $Files = @(Get-Item -LiteralPath @($KnownChangedFiles.Values) -ErrorAction SilentlyContinue | Where-Object { $Extensions -contains $_.Extension -and $_.FullName -notmatch $DefaultExclude -and ([string]::IsNullOrWhiteSpace($AdditionalExclude) -or $_.FullName -notmatch $AdditionalExclude) -and ($_.Length/1MB) -le $MaxFileMB })
+    } elseif($ChangedOnly){
+        Write-Host "PSSCP_CHANGED_ONLY=1 but no changed PowerShell files were found under $Root" -ForegroundColor Yellow
+        return
     } else {
         $Files = @(Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $Extensions -contains $_.Extension -and $_.FullName -notmatch $DefaultExclude -and ([string]::IsNullOrWhiteSpace($AdditionalExclude) -or $_.FullName -notmatch $AdditionalExclude) -and ($_.Length/1MB) -le $MaxFileMB })
     }
@@ -414,6 +432,15 @@ try { Get-Process | Out-Null } catch {}
             $Suppressions[$rel] = @(_FindSuppressionComments $raw)
             foreach($s in @($Suppressions[$rel])){
                 if([string]::IsNullOrWhiteSpace($s.Reason)){ _Add $rel 'PSSCP090' Warning Maintainability Suppression $s.Line Medium 'PSSCP suppression has no justification' 'Add a short reason after a hyphen so reviewers know why the suppression is acceptable' $s.Raw }
+                foreach($k in @($s.Keys)){
+                    $kk = $k.Trim()
+                    if($kk -and $kk -ne '*' -and -not $RuleMeta.ContainsKey($kk) -and ($RuleMeta.Values.Category -notcontains $kk) -and ($SuppressionKnownAreas -notcontains $kk)){
+                        _Add $rel 'PSSCP090' Info Maintainability Suppression $s.Line Low "Suppression key '$kk' is not a known rule ID/category/area" 'Verify the suppression key matches the intended finding; otherwise it may not suppress anything' $s.Raw
+                    }
+                    if($kk -eq '*'){
+                        _Add $rel 'PSSCP090' Warning Maintainability Suppression $s.Line Medium 'Wildcard suppression used' 'Avoid broad suppressions unless the whole file is intentionally exempt and the reason is clear' $s.Raw
+                    }
+                }
             }
             $tok = $null; $err = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName,[ref]$tok,[ref]$err)
@@ -461,8 +488,10 @@ try { Get-Process | Out-Null } catch {}
         $crlf = ([regex]::Matches($raw,"`r`n")).Count; $lf = ([regex]::Matches($raw,"(?<!`r)`n")).Count
         if($crlf -gt 0 -and $lf -gt 0){ _Add $rel 'PSSCP003' Info Syntax Formatting 0 Low 'Mixed CRLF/LF line endings detected' 'Normalise line endings if tooling behaves inconsistently' }
         try {
-            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName -ErrorAction SilentlyContinue
-            if($sig -and $sig.Status -notin @('Valid','NotSigned')){ _Add $rel 'PSSCP034' Warning Security Signature 0 Medium "Authenticode signature status: $($sig.Status)" 'Verify signature status before trusting the file' $sig.StatusMessage }
+            if(Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue){
+                $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName -ErrorAction SilentlyContinue
+                if($sig -and $sig.Status -notin @('Valid','NotSigned')){ _Add $rel 'PSSCP034' Warning Security Signature 0 Medium "Authenticode signature status: $($sig.Status)" 'Verify signature status before trusting the file' $sig.StatusMessage }
+            }
         } catch {}
 
         $tokens = $null; $parseErrors = $null
@@ -492,7 +521,9 @@ try { Get-Process | Out-Null } catch {}
             foreach($edition in @($req.RequiredPSEditions)){
                 if($edition -and $edition -ne $PSVersionTable.PSEdition){ _Add $rel 'PSSCP062' Warning Compatibility PSEdition 0 Medium "Script requires PSEdition $edition; current is $($PSVersionTable.PSEdition)" 'Run under the intended PowerShell edition or verify compatibility' }
             }
-            if($req.RequiresElevation){
+            $requiresElevation = $false
+            try { $requiresElevation = [bool]$req.IsElevationRequired -or [bool]$req.RequiresElevation } catch {}
+            if($requiresElevation){
                 $isAdmin = $false
                 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator) } catch {}
                 if(-not $isAdmin){ _Add $rel 'PSSCP010' Warning Dependency Requires 0 High 'Script declares #Requires -RunAsAdministrator but current shell is not elevated' 'Open an elevated PowerShell session if you intend to run it' }
@@ -560,7 +591,7 @@ try { Get-Process | Out-Null } catch {}
         if($cmdList -match '^(Get|Set|New|Remove|Update|Invoke|Connect|Disconnect)-Mg'){ $families.Add('Microsoft.Graph') | Out-Null }
         if($cmdList -match '^(Get|Set|New|Remove|Update|Invoke|Connect|Disconnect)-Az'){ $families.Add('Az') | Out-Null }
         if($cmdList -match '^(Get|Set|New|Remove|Update|Connect|Disconnect)-PnP'){ $families.Add('PnP.PowerShell') | Out-Null }
-        if($cmdList -match '^(Get|Set|New|Remove|Update)-AD' -or $cmdList -contains 'Import-Module' -and $raw -match 'ActiveDirectory'){ $families.Add('ActiveDirectory') | Out-Null }
+        if(($cmdList -match '^(Get|Set|New|Remove|Update)-AD') -or (($cmdList -contains 'Import-Module') -and ($raw -match 'ActiveDirectory'))){ $families.Add('ActiveDirectory') | Out-Null }
         if($cmdList -match '^(Get|Set|New|Remove|Update)-EXO' -or $cmdList -contains 'Connect-ExchangeOnline' -or $cmdList -match '^(Get|Set|New|Remove)-Mailbox|^(Get|Set|New|Remove)-Recipient'){ $families.Add('ExchangeOnlineManagement') | Out-Null }
         foreach($fam in @($families | Sort-Object -Unique)){
             _Add $rel 'PSSCP015' Info Dependency ModuleFamily 0 Low "Detected likely module family: $fam" 'Verify module requirement/import/connection handling matches the script intent'
@@ -613,7 +644,7 @@ try { Get-Process | Out-Null } catch {}
             @('PSSCP032','Warning','Security','Interop','Add-Type|DllImport|Reflection\.Assembly|New-Object\s+-ComObject|\[Runtime\.InteropServices','Native interop/reflection/COM pattern detected','Review trust, platform compatibility, and whether native code is necessary','Medium'),
             @('PSSCP033','Warning','Security','SupplyChain','Install-Module|Install-Script|Set-PSRepository|Register-PSRepository|Unregister-PSRepository','Repository/module installation command detected','Verify repository trust, version pinning, and supply-chain controls','Medium'),
             @('PSSCP040','Warning','Reliability','Errors','-ErrorAction\s+SilentlyContinue|\$ErrorActionPreference\s*=\s*["'']SilentlyContinue["'']','Silent error handling detected','Avoid hiding failures unless explicitly justified, logged, and reflected in final status','High'),
-            @('PSSCP056','Warning','Maintainability','Placeholder','<tenant-id>|<subscription-id>|<client-id>|YOUR_|REPLACE_ME|CHANGEME|example\.com|contoso\.com|TODO_REPLACE','Placeholder/sample value detected','Replace placeholders with parameters, validated inputs, or documented samples before use','Medium'),
+            @('PSSCP060','Warning','Maintainability','Placeholder','<tenant-id>|<subscription-id>|<client-id>|YOUR_|REPLACE_ME|CHANGEME|example\.com|contoso\.com|TODO_REPLACE','Placeholder/sample value detected','Replace placeholders with parameters, validated inputs, or documented samples before use','Medium'),
             @('PSSCP080','Info','Maintainability','Marker','TODO|FIXME|HACK|TEMP|WORKAROUND','Marker detected','Resolve or explicitly confirm before production use','Low')
         )
         foreach($p in $patterns){
@@ -750,7 +781,7 @@ try { Get-Process | Out-Null } catch {}
     $saStatus = if($SA){ "Enabled: $($SA.Version)" } else { 'Unavailable' }
     $Context = [pscustomobject]@{
         Tool=$ToolName;ToolVersion=$ToolVersion;Profile=$Profile;RunTime=(Get-Date).ToString('s');Root=$Root;FilesScanned=$Files.Count;ChangedOnly=$ChangedOnly;SelfTest=$SelfTest;ExecutedTargetScripts=$false;
-        PowerShell="$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)";PSScriptAnalyzer=$saStatus;AutoInstallDependencies=$AutoInstallDeps;CrossParse=$CrossParse;WriteReports=$WriteReports;FailOn=$FailOn;MinScore=$MinScore;MaxFileMB=$MaxFileMB
+        PowerShell="$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)";PSScriptAnalyzer=$saStatus;AutoInstallDependencies=$AutoInstallDeps;CrossParse=$CrossParse;WriteReports=$WriteReports;FailOn=$FailOn;MinScore=$MinScore;MaxFileMB=$MaxFileMB;KeepSelfTest=$KeepSelfTest
     }
 
     $GateFail = $false; $GateReasons = [Collections.Generic.List[string]]::new()
@@ -803,4 +834,5 @@ try { Get-Process | Out-Null } catch {}
         $global:LASTEXITCODE = 0
     }
     Write-Host 'Static only. Scripts were not executed. This estimates static validity only; it cannot prove runtime permissions, API coverage, pagination, live data correctness, output completeness, or business efficacy.' -ForegroundColor Green
+    if($SelfTest -and -not $KeepSelfTest -and -not $WriteReports){ try { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue } catch {} }
 }
