@@ -1,5 +1,5 @@
 <#
-PSSCP v6 - PowerShell Script Checker Plus
+PSSCP v6.0.1 - PowerShell Script Checker Plus
 
 Purpose
 -------
@@ -56,7 +56,7 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     # Configuration
     # -----------------------------
     $ToolName = 'PSSCP'
-    $ToolVersion = '6.0.0'
+    $ToolVersion = '6.0.1'
     $Profile = if($env:PSSCP_PROFILE){ $env:PSSCP_PROFILE } else { 'General' }
     $AutoInstallDeps = ($env:PSSCP_NO_INSTALL -ne '1')
     $WriteReports = ($env:PSSCP_WRITE_REPORTS -eq '1')
@@ -191,11 +191,11 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
         for($j=0;$j -le $B.Length;$j++){ $d[0,$j] = $j }
         for($i=1;$i -le $A.Length;$i++){
             for($j=1;$j -le $B.Length;$j++){
-                if([char]::ToLowerInvariant($A[$i-1]) -eq [char]::ToLowerInvariant($B[$j-1])){ $cost = 0 } else { $cost = 1 }
-                $d[$i,$j] = [Math]::Min([Math]::Min($d[$i-1,$j]+1,$d[$i,$j-1]+1),$d[$i-1,$j-1]+$cost)
+                if([char]::ToLowerInvariant($A[($i-1)]) -eq [char]::ToLowerInvariant($B[($j-1)])){ $cost = 0 } else { $cost = 1 }
+                $d[$i,$j] = [Math]::Min([Math]::Min($d[($i-1),$j]+1,$d[$i,($j-1)]+1),$d[($i-1),($j-1)]+$cost)
             }
         }
-        return $d[$A.Length,$B.Length]
+        return $d[($A.Length),($B.Length)]
     }
     function _Closest([string]$Name,$Valid){
         $best = $null; $bestD = 999
