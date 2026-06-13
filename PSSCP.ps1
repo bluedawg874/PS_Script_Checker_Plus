@@ -186,16 +186,22 @@ tenant completeness, runtime output accuracy, business intent, or whether a scri
     function _Distance([string]$A,[string]$B){
         if($null -eq $A){ $A = '' }
         if($null -eq $B){ $B = '' }
+        if($A -eq $B){ return 0 }
+        if($A.Length -eq 0){ return $B.Length }
+        if($B.Length -eq 0){ return $A.Length }
         $d = New-Object 'int[,]' ($A.Length + 1),($B.Length + 1)
-        for($i=0;$i -le $A.Length;$i++){ $d[$i,0] = $i }
-        for($j=0;$j -le $B.Length;$j++){ $d[0,$j] = $j }
+        for($i=0;$i -le $A.Length;$i++){ $d.SetValue($i,$i,0) }
+        for($j=0;$j -le $B.Length;$j++){ $d.SetValue($j,0,$j) }
         for($i=1;$i -le $A.Length;$i++){
             for($j=1;$j -le $B.Length;$j++){
                 if([char]::ToLowerInvariant($A[($i-1)]) -eq [char]::ToLowerInvariant($B[($j-1)])){ $cost = 0 } else { $cost = 1 }
-                $d[$i,$j] = [Math]::Min([Math]::Min($d[($i-1),$j]+1,$d[$i,($j-1)]+1),$d[($i-1),($j-1)]+$cost)
+                $del = [int]$d.GetValue(($i-1),$j) + 1
+                $ins = [int]$d.GetValue($i,($j-1)) + 1
+                $sub = [int]$d.GetValue(($i-1),($j-1)) + $cost
+                $d.SetValue([Math]::Min([Math]::Min($del,$ins),$sub),$i,$j)
             }
         }
-        return $d[($A.Length),($B.Length)]
+        return [int]$d.GetValue($A.Length,$B.Length)
     }
     function _Closest([string]$Name,$Valid){
         $best = $null; $bestD = 999
